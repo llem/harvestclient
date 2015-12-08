@@ -6,19 +6,25 @@ import com.enonic.harvest.harvestclient.parameters.GetDayEntriesByUserParameters
 import com.enonic.harvest.harvestclient.parameters.GetRecentInvoicesParameters;
 import com.enonic.harvest.harvestclient.parameters.GetDayEntriesByProjectParameters;
 import com.enonic.harvest.harvestclient.models.*;
+
 import org.apache.http.NameValuePair;
 import org.apache.http.client.utils.URLEncodedUtils;
 import org.apache.http.message.BasicNameValuePair;
 
 import java.io.InputStream;
 import java.io.UnsupportedEncodingException;
+import java.math.BigDecimal;
 import java.net.URLEncoder;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Calendar;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
-class DefaultHarvestClient
+
+public class DefaultHarvestClient
         implements HarvestClient
 {
     private String username;
@@ -27,6 +33,9 @@ class DefaultHarvestClient
 
     private SimpleDateFormat dateFormatter     = new SimpleDateFormat("yyyyMMdd");
     private SimpleDateFormat dateTimeFormatter = new SimpleDateFormat("yyyy-MM-dd hh:mm");
+    
+    // Cache of recent invoices used for mapping invoice number to invoice ID (not included in Harvest CSV export).
+    private Map<String, Integer> invoiceCache = new HashMap<String, Integer>();
 
     public DefaultHarvestClient(String username, String password, String subDomain)
     {
@@ -276,18 +285,18 @@ class DefaultHarvestClient
     {
         List<NameValuePair> urlParams = new ArrayList<NameValuePair>();
 
-        if (params.page != null)
-            urlParams.add(new BasicNameValuePair("page", params.page.toString()));
-        if (params.fromDate != null)
-            urlParams.add(new BasicNameValuePair("from", this.dateFormatter.format(params.fromDate)));
-        if (params.toDate != null)
-            urlParams.add(new BasicNameValuePair("to", this.dateFormatter.format(params.toDate)));
-        if (params.updatedSince != null)
-            urlParams.add(new BasicNameValuePair("updated_since", this.dateFormatter.format(params.updatedSince)));
-        if (params.status != null)
-            urlParams.add(new BasicNameValuePair("status", params.status));
-        if (params.client != null)
-            urlParams.add(new BasicNameValuePair("client", params.client.toString()));
+        if (params.getPage() != null)
+            urlParams.add(new BasicNameValuePair("page", params.getPage().toString()));
+        if (params.getFromDate() != null)
+            urlParams.add(new BasicNameValuePair("from", this.dateFormatter.format(params.getFromDate())));
+        if (params.getToDate() != null)
+            urlParams.add(new BasicNameValuePair("to", this.dateFormatter.format(params.getToDate())));
+        if (params.getUpdatedSince() != null)
+            urlParams.add(new BasicNameValuePair("updated_since", this.dateFormatter.format(params.getUpdatedSince())));
+        if (params.getStatus() != null)
+            urlParams.add(new BasicNameValuePair("status", params.getStatus()));
+        if (params.getClient() != null)
+            urlParams.add(new BasicNameValuePair("client", params.getClient().toString()));
 
         String urlParamString = URLEncodedUtils.format(urlParams, "utf-8");
 
@@ -345,5 +354,70 @@ class DefaultHarvestClient
         request.setUsername(this.username);
         request.setPassword(this.password);
         return request.getInputStream();
+    }
+    
+    public int populateInvoiceCache(Date from, Date to) {
+        // Clear the existing cache
+        invoiceCache.clear();
+        
+        int currentPage = 1;
+        GetRecentInvoicesParameters params = new GetRecentInvoicesParameters();
+        params.setFromDate(from);
+        params.setToDate(to);
+        params.setPage(currentPage);
+        boolean resultsExhausted = false;
+        List<Invoice> recentInvoices = new ArrayList<Invoice>();
+        
+        // Iterate through the result pages until no further invoices are found
+        while (!resultsExhausted) {
+            
+            System.out.println("Retrieving recent invoices, page " + currentPage);
+            InvoiceCollection invoiceCollection = getRecentInvoices(params);
+            List<Invoice> invoiceList = invoiceCollection.getList();
+
+            if (invoiceList.size() > 0)
+                recentInvoices.addAll(invoiceList);
+            else
+                resultsExhausted = true;
+            
+            currentPage++;
+            params.setPage(currentPage);
+        }
+            
+        // Populate the cache with the Number --> Id mapping
+        for (Invoice invoice:recentInvoices)
+            invoiceCache.put(invoice.getNumber(), invoice.getId());
+        
+        return recentInvoices.size();
+    }
+    
+    public void postInvoicePayment(int invoiceId, String paymentReference, BigDecimal paymentAmount) throws HarvestClientException {
+        // Create and populate the payment object
+        InvoicePayment payment = new InvoicePayment();
+        payment.setPaidAt(new Date());
+        payment.setAmount(paymentAmount);
+        payment.setNotes(paymentReference);
+
+        // DIAGNOSTIC
+        System.out.println(InvoicePayment.marshal(payment));
+        
+        HarvestPostRequest request = new HarvestPostRequest();
+        request.setUrl(String.format("/invoices/%s/payments", invoiceId));
+        request.setSubdomain(this.subDomain);
+        request.setUsername(this.username);
+        request.setPassword(this.password);
+
+        // Execute the POST request
+        request.executePostRequest(InvoicePayment.marshal(payment));
+    }
+
+    public void postInvoicePayment(String invoiceNumber, String paymentReference, BigDecimal paymentAmount) throws HarvestClientException {
+        // Lookup the invoice Id from the cache
+        Integer invoiceId = invoiceCache.get(invoiceNumber);
+        
+        if (invoiceId != null)
+            postInvoicePayment(invoiceId, paymentReference, paymentAmount);
+        else
+            throw new HarvestClientException("Unable to find invoice number " + invoiceNumber + " in cache.");
     }
 }
